@@ -1,0 +1,99 @@
+# ============================================================
+# AWS Cloud Web Application — .gitignore
+# SECURITY: Never commit credentials, keys, or secrets
+# ============================================================
+
+# AWS credentials — NEVER commit these
+.aws/
+*.pem
+*.ppk
+*_rsa
+*_rsa.pub
+credentials
+aws-credentials*
+aws_credentials*
+
+# Environment files with secrets
+.env
+.env.*
+*.env
+secrets.json
+secrets.yaml
+secrets.yml
+
+# Terraform state (may contain secrets)
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.hcl
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CloudFormation — never commit parameter files with secrets
+cfn-parameters-prod*
+cfn-parameters-secret*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-selfcheck.json
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node (if any front-end tooling is added later)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs — do NOT commit real server logs with user data
+*.log
+web-server-logs/
+/logs/
+
+# Key pairs — CRITICAL: never commit EC2 key pairs
+*.pem
+*.ppk
+keypair*
+key-pair*
+
+# Backup files
+*.bak
+*.backup
+*.orig

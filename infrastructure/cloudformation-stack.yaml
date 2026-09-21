@@ -1,0 +1,529 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  InternshipAWS — Complete AWS Cloud Web Application Stack.
+  Creates: VPC, Public Subnet, Internet Gateway, Route Table,
+  Security Group, S3 Bucket, IAM Role, EC2 Instance, SNS Topic,
+  CloudWatch Alarms, and resource tagging.
+
+  COST SAFETY CHECKLIST (verified in this template):
+  ✅ NO NAT Gateway
+  ✅ NO Load Balancer
+  ✅ NO RDS
+  ✅ NO Auto Scaling Group
+  ✅ Exactly ONE EC2 instance
+  ✅ EBS volume = 8 GB gp3 (within 30 GB Free Tier)
+  ✅ Only 2 CloudWatch alarms (within 10 free)
+  ✅ SNS email (within free tier)
+  ⚠️  EBS Snapshot is created MANUALLY after launch (see backup docs)
+  ⚠️  AWS Budgets are created MANUALLY (see monitoring docs)
+
+# ──────────────────────────────────────────────────────────────
+# PARAMETERS — customise before deploying
+# ──────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: InternshipAWS
+    Description: Project name used for resource naming and tagging.
+
+  EnvironmentName:
+    Type: String
+    Default: Demo
+    AllowedValues: [Demo, Dev, Staging]
+    Description: Environment tag value.
+
+  OwnerName:
+    Type: String
+    Default: intern
+    Description: Your name — used in resource tags (Owner=<yourname>).
+
+  S3BucketName:
+    Type: String
+    Description: >
+      GLOBALLY UNIQUE S3 bucket name.
+      Suggested format: internship-aws-YOURNAME-2026
+      Must be lowercase, 3-63 characters, no spaces.
+    AllowedPattern: ^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$
+    ConstraintDescription: Must be a valid S3 bucket name (lowercase, hyphens allowed).
+
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+    Description: >
+      EC2 instance type used for this project.
+      Always verify current AWS Free Tier eligibility and pricing in the
+      AWS Billing and Cost Management console.
+
+  EC2KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Name of an EXISTING EC2 Key Pair for SSH access.
+      Create one at EC2 → Key Pairs before deploying this stack.
+      NEVER commit the .pem file to git.
+
+  AdminSSHCIDR:
+    Type: String
+    Description: >
+      Your public IP address in CIDR notation for SSH access.
+      Example: 203.0.113.10/32
+      Find your IP at https://checkip.amazonaws.com
+      DO NOT use 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR block (e.g. 1.2.3.4/32).
+
+  NotificationEmail:
+    Type: String
+    Description: >
+      Email address to receive CloudWatch alarm notifications.
+      You MUST confirm the subscription from the email AWS sends.
+    AllowedPattern: ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address.
+
+  LatestUbuntuAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: >
+      Ubuntu Server 22.04 LTS AMI ID (retrieved dynamically from SSM Parameter Store).
+      This ensures you always get a current, Free Tier eligible Ubuntu AMI
+      without hardcoding a region-specific AMI ID.
+
+# ──────────────────────────────────────────────────────────────
+# RESOURCES
+# ──────────────────────────────────────────────────────────────
+Resources:
+
+  # ============================================================
+  # NETWORKING
+  # ============================================================
+
+  # VPC
+  InternshipVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-VPC"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # Internet Gateway
+  InternshipIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-IGW"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # Attach Internet Gateway to VPC
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref InternshipVPC
+      InternetGatewayId: !Ref InternshipIGW
+
+  # Public Subnet
+  InternshipPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref InternshipVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true      # Auto-assign public IPv4 — enables internet connectivity
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ""                 # First AZ in the region
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-PublicSubnet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # Route Table
+  InternshipPublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InternshipVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-PublicRT"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # Public route: 0.0.0.0/0 → Internet Gateway
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref InternshipPublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternshipIGW
+
+  # Associate public subnet with route table
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InternshipPublicSubnet
+      RouteTableId: !Ref InternshipPublicRT
+
+  # ============================================================
+  # SECURITY GROUP
+  # ============================================================
+  InternshipWebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-WebSG"
+      GroupDescription: Security group for InternshipAWS EC2 web server
+      VpcId: !Ref InternshipVPC
+      SecurityGroupIngress:
+        # SSH — restricted to admin IP only (NEVER 0.0.0.0/0)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminSSHCIDR
+          Description: SSH from administrator IP only
+        # HTTP — open for web demonstration
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP public web access for demonstration
+      SecurityGroupEgress:
+        # Allow all outbound (needed for apt, AWS CLI, S3 access)
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-WebSG"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # ============================================================
+  # IAM — EC2 Instance Role
+  # ============================================================
+
+  # Trust policy: allows EC2 service to assume this role
+  InternshipEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EC2S3Role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # Least-privilege S3 policy — only the project bucket, only required actions
+  InternshipS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-S3BucketPolicy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow listing the bucket contents
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${S3BucketName}"
+          # Allow reading and writing objects in the bucket
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub "arn:aws:s3:::${S3BucketName}/*"
+      Roles:
+        - !Ref InternshipEC2Role
+
+  # Instance Profile — links the role to the EC2 instance
+  InternshipInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-InstanceProfile"
+      Roles:
+        - !Ref InternshipEC2Role
+
+  # ============================================================
+  # S3 BUCKET — Private, Block all public access
+  # ============================================================
+  InternshipS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      # Block ALL public access — nothing in this bucket is ever public
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning disabled — keeps storage minimal for demo
+      VersioningConfiguration:
+        Status: Suspended
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # ============================================================
+  # EC2 INSTANCE — Single t3.micro
+  # ============================================================
+  InternshipEC2:
+    Type: AWS::EC2::Instance
+    DependsOn: IGWAttachment
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      ImageId: !Ref LatestUbuntuAMI
+      KeyName: !Ref EC2KeyPairName
+      SubnetId: !Ref InternshipPublicSubnet
+      SecurityGroupIds:
+        - !Ref InternshipWebSG
+      IamInstanceProfile: !Ref InternshipInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 8           # 8 GB — well within 30 GB Free Tier
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: false        # Encryption incurs no extra cost but
+                                     # requires KMS key — keeping simple for demo
+      # UserData: Bootstrap script that installs Nginx and deploys the app
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/user-data.log 2>&1
+
+          # ── System Update ────────────────────────────────
+          apt-get update -y
+          apt-get upgrade -y
+
+          # ── Install Nginx, Python, AWS CLI ───────────────
+          apt-get install -y nginx python3 python3-pip awscli
+
+          # ── Enable and start Nginx ───────────────────────
+          systemctl enable nginx
+          systemctl start nginx
+
+          # ── Create web root directories ──────────────────
+          mkdir -p /var/www/html
+          mkdir -p /var/log/internship
+
+          # ── Nginx server block configuration ─────────────
+          cat > /etc/nginx/sites-available/internship << 'NGINXCONF'
+          server {
+              listen 80;
+              server_name _;
+              root /var/www/html;
+              index index.html;
+
+              access_log /var/log/nginx/internship_access.log;
+              error_log  /var/log/nginx/internship_error.log;
+
+              location / {
+                  try_files $uri $uri/ =404;
+                  autoindex off;
+              }
+
+              add_header X-Content-Type-Options "nosniff";
+              add_header X-Frame-Options "SAMEORIGIN";
+              add_header X-XSS-Protection "1; mode=block";
+          }
+          NGINXCONF
+
+          ln -sf /etc/nginx/sites-available/internship /etc/nginx/sites-enabled/internship
+          rm -f /etc/nginx/sites-enabled/default
+          nginx -t
+          systemctl reload nginx
+
+          # ── Write instance metadata (no secrets) ─────────
+          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+          AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+          cat > /var/www/html/server-info.txt << EOF
+          InternshipAWS Server Info
+          Instance: ${!INSTANCE_ID}
+          Region:   ${!REGION}
+          AZ:       ${!AZ}
+          EOF
+
+          # ── S3 bucket name available to scripts ──────────
+          echo "${S3BucketName}" > /home/ubuntu/s3-bucket-name.txt
+          chmod 600 /home/ubuntu/s3-bucket-name.txt
+
+          echo "UserData bootstrap complete" >> /var/log/user-data.log
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-WebServer"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # ============================================================
+  # SNS — Alert Topic
+  # ============================================================
+  InternshipSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: InternshipAWSAlerts
+      DisplayName: InternshipAWS CloudWatch Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # ============================================================
+  # CLOUDWATCH ALARMS
+  # Free Tier: 10 alarm-metrics/month. This template uses 2.
+  # ============================================================
+
+  # CPU Utilisation Alarm
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-CPUUtilizationAlarm"
+      AlarmDescription: >
+        Triggers when EC2 CPU exceeds 70% for 5 consecutive minutes.
+        Publishes to InternshipAWSAlerts SNS topic.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref InternshipEC2
+      Statistic: Average
+      Period: 300        # 5 minutes (300 seconds)
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref InternshipSNSTopic
+      OKActions:
+        - !Ref InternshipSNSTopic
+
+  # EC2 Status Check Alarm
+  StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-StatusCheckAlarm"
+      AlarmDescription: >
+        Triggers when EC2 instance or system status check fails.
+        Indicates a hardware or OS-level problem.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref InternshipEC2
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref InternshipSNSTopic
+      OKActions:
+        - !Ref InternshipSNSTopic
+
+# ──────────────────────────────────────────────────────────────
+# OUTPUTS — useful values after stack creation
+# ──────────────────────────────────────────────────────────────
+Outputs:
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref InternshipVPC
+    Export:
+      Name: !Sub "${ProjectName}-VPCID"
+
+  PublicSubnetId:
+    Description: Public Subnet ID
+    Value: !Ref InternshipPublicSubnet
+    Export:
+      Name: !Sub "${ProjectName}-PublicSubnetID"
+
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref InternshipEC2
+    Export:
+      Name: !Sub "${ProjectName}-EC2InstanceID"
+
+  EC2PublicIP:
+    Description: EC2 Public IP Address
+    Value: !GetAtt InternshipEC2.PublicIp
+
+  WebsiteURL:
+    Description: Public URL to access the web application
+    Value: !Sub "http://${InternshipEC2.PublicIp}"
+
+  HealthCheckURL:
+    Description: Health check endpoint URL
+    Value: !Sub "http://${InternshipEC2.PublicIp}/health"
+
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref InternshipS3Bucket
+    Export:
+      Name: !Sub "${ProjectName}-S3BucketName"
+
+  SNSTopicARN:
+    Description: SNS Topic ARN for CloudWatch Alarms
+    Value: !Ref InternshipSNSTopic
+
+  EC2RoleARN:
+    Description: IAM Role ARN attached to EC2
+    Value: !GetAtt InternshipEC2Role.Arn
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref InternshipWebSG
